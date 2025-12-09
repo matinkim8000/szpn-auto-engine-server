@@ -1,113 +1,102 @@
+import { ethers } from "ethers";
 import admin from "firebase-admin";
-import { JsonRpcProvider, Wallet, Contract, parseUnits } from "ethers";
 
-// ======================
-// ★ Firebase 초기화 영역
-// ======================
+// -------------------------------------
+// 1) Firebase Admin 초기화 (Base64 Key)
+// -------------------------------------
 if (!admin.apps.length) {
-  if (!process.env.FIREBASE_KEY_BASE64) {
-    throw new Error("FIREBASE_KEY_BASE64 is missing");
-  }
-
-  // Base64 → JSON 변환
-  const firebaseKeyJson = JSON.parse(
+  const firebaseKey = JSON.parse(
     Buffer.from(process.env.FIREBASE_KEY_BASE64, "base64").toString("utf8")
   );
 
   admin.initializeApp({
-    credential: admin.credential.cert(firebaseKeyJson),
+    credential: admin.credential.cert(firebaseKey),
   });
 }
 
 const db = admin.firestore();
 
-// ======================
-// ★ RPC & Wallet 설정
-// ======================
-const provider = new JsonRpcProvider(process.env.RPC_URL);
+// -------------------------------------
+// 2) Web3 초기 설정
+// -------------------------------------
+const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 
-if (!process.env.PRIVATE_KEY) {
-  throw new Error("PRIVATE_KEY is missing");
-}
-if (!process.env.AUTOSEND_ADDRESS) {
-  throw new Error("AUTOSEND_ADDRESS is missing");
-}
-if (!process.env.TOKEN_ADDRESS) {
-  throw new Error("TOKEN_ADDRESS is missing");
-}
+const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
-const wallet = new Wallet(process.env.PRIVATE_KEY, provider);
-
-// ======================
-// ★ AutoSend 컨트랙트 불러오기
-// ======================
-const autoSendAbi = [
-  "function autoSendTokens(address token, uint256 gasAmount, uint256 poolAmount, uint256 feeAmount) external"
+// 토큰 인터페이스 (BEP20 / ERC20 호환)
+const tokenAbi = [
+  "function transfer(address to, uint256 amount) public returns (bool)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "event Transfer(address indexed from, address indexed to, uint amount)"
 ];
 
-const autoSend = new Contract(
-  process.env.AUTOSEND_ADDRESS,
-  autoSendAbi,
+const token = new ethers.Contract(
+  process.env.TOKEN_ADDRESS,
+  tokenAbi,
   wallet
 );
 
-const TOKEN = process.env.TOKEN_ADDRESS;
+// -------------------------------------
+// 3) 응답 헬퍼
+// -------------------------------------
+function resJSON(res, status, data) {
+  return res.status(status).json(data);
+}
 
-// 테스트: 1분 간격
-const TEST_INTERVAL = 60 * 1000;
+// -------------------------------------
+// 4) 오토엔진 테스트 송금 기능
+// -------------------------------------
+async function sendToken(to, amount) {
+  try {
+    const decimals = 18;
+    const amountWei = ethers.parseUnits(amount.toString(), decimals);
 
-// ======================
-// ★ 메인 Handler
-// ======================
+    const tx = await token.transfer(to, amountWei);
+    await tx.wait();
+
+    return {
+      success: true,
+      txHash: tx.hash,
+    };
+  } catch (err) {
+    console.error("SendToken Error:", err);
+    return {
+      success: false,
+      error: err.message,
+    };
+  }
+}
+
+// -------------------------------------
+// 5) API 라우트
+// -------------------------------------
 export default async function handler(req, res) {
   try {
-    console.log("=== Auto Engine 시작 ===");
+    const { action } = req.query;
 
-    const snapshot = await db.collection("users").get();
-    const now = Date.now();
-
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-
-      // next_active 조건 체크
-      if (!data.next_active || now < data.next_active) {
-        continue;
-      }
-
-      console.log(`▶ 실행 대상 지갑: ${doc.id}`);
-
-      // ======================
-      // ★ 송금 세팅
-      // ======================
-      const gas = parseUnits("0.6", 18);   // 가스 소액
-      const pool = parseUnits("90", 18);   // 풀 참여
-      const fee = parseUnits("18", 18);    // 시스템 Fee
-
-      // ======================
-      // ★ 컨트랙트 실행
-      // ======================
-      const tx = await autoSend.autoSendTokens(TOKEN, gas, pool, fee);
-      await tx.wait();
-
-      console.log("완료 TX:", tx.hash);
-
-      // ======================
-      // ★ Firestore 업데이트
-      // ======================
-      await db.collection("users").doc(doc.id).update({
-        last_action: now,
-        next_active: now + TEST_INTERVAL,
-        last_tx: tx.hash,
-        updated_at: new Date().toISOString(),
-      });
-
-      console.log(`업데이트 완료: ${doc.id}`);
+    // 기본 Ping 테스트
+    if (action === "ping") {
+      return resJSON(res, 200, { ok: true, message: "Auto Engine API Running" });
     }
 
-    return res.status(200).json({ ok: true });
+    // 토큰 송금 테스트
+    if (action === "send") {
+      const { to, amount } = req.body;
+
+      if (!to || !amount) {
+        return resJSON(res, 400, { error: "Missing to / amount" });
+      }
+
+      const result = await sendToken(to, amount);
+
+      return resJSON(res, 200, result);
+    }
+
+    // 잘못된 접근
+    return resJSON(res, 400, { error: "Invalid action" });
 
   } catch (err) {
-    console.error("🔥 ERROR:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("API Error:", err);
+    return resJSON(res, 500, { error: err.message });
   }
 }

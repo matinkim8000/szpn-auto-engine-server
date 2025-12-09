@@ -1,98 +1,127 @@
 // api/auto-martin.js
-import admin from "firebase-admin";
 import { JsonRpcProvider, Wallet, Contract, parseUnits } from "ethers";
 
-// ==========================
-//  Firebase 초기화
-// ==========================
-if (!admin.apps.length) {
-  const firebaseKey = JSON.parse(
-    Buffer.from(process.env.FIREBASE_KEY_BASE64, "base64").toString("utf8")
-  );
+// ===== 기본 설정 =====
 
-  admin.initializeApp({
-    credential: admin.credential.cert(firebaseKey),
-  });
-}
-
-const db = admin.firestore();
-
-// ==========================
-//  RPC + Wallet 초기화
-// ==========================
+// BSC RPC
 const provider = new JsonRpcProvider(process.env.RPC_URL);
-const wallet = new Wallet(process.env.PRIVATE_KEY_MARTIN, provider);
 
-// ==========================
-//  AutoSend Contract
-// ==========================
-const autoSendAbi = [
-  "function autoSendTokens(address token, uint256 gasAmount, uint256 poolAmount, uint256 feeAmount) external"
+// 하이브3 풀(컨트랙트) 주소 — 여기에 0.2 SZPN이 들어가야 함
+const POOL_ADDRESS = "0xb3cf454ba8bd35134c14f7b5426D6d70585D0903";
+
+// SZPN 토큰 컨트랙트 주소 (환경변수에서 가져옴)
+const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS;
+
+// ERC-20 기본 ABI
+const erc20Abi = [
+  "function transfer(address to, uint256 amount) public returns (bool)",
+  "function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)",
 ];
 
-const autoSend = new Contract(
-  process.env.AUTOSEND_ADDRESS,
-  autoSendAbi,
-  wallet
-);
+// ===== 여러 지갑 프라이빗키 읽기 =====
+function getPrivateKeysFromEnv() {
+  const keys = [];
 
-// ==========================
-//  설정값
-// ==========================
-const TOKEN = process.env.TOKEN_ADDRESS;
-const POOL = process.env.POOL_ADDRESS;
+  // 필요하면 최대 50까지 늘릴 수 있음
+  for (let i = 1; i <= 20; i++) {
+    const key = process.env[`PRIVATE_KEY_${i}`];
+    if (key && key.trim() !== "") {
+      keys.push({
+        index: i,
+        privateKey: key.trim(),
+      });
+    }
+  }
 
-// 테스트용: 1분 간격
-const TEST_INTERVAL = 60 * 1000;
+  return keys;
+}
 
 export default async function handler(req, res) {
   try {
-    console.log("=== 마틴 자동엔진 실행 ===");
+    const { action = "run", amount = "0.2" } = req.query || {};
 
-    // Firestore 사용자 정보 (마틴 전용 문서)
-    const ref = db.collection("engine").doc("martin");
-    const snap = await ref.get();
-    const data = snap.exists ? snap.data() : {};
-
-    const now = Date.now();
-
-    // next_active 이전이면 아무것도 하지 않음
-    if (data.next_active && now < data.next_active) {
+    // 헬스체크용
+    if (action === "ping") {
       return res.status(200).json({
-        ok: false,
-        msg: "아직 실행 시간이 아님",
-        next_active: data.next_active
+        ok: true,
+        message: "auto-martin API Running",
       });
     }
 
-    // ===== 전송 파라미터 =====
-    const gas = parseUnits("0.06", 18);
-    const poolAmount = parseUnits("90", 18);
-    const fee = parseUnits("18", 18);
+    if (!RPC_URL_OK() || !TOKEN_ADDRESS) {
+      return res.status(500).json({
+        ok: false,
+        error: "RPC_URL 또는 TOKEN_ADDRESS 환경변수가 설정되지 않았습니다.",
+      });
+    }
 
-    console.log("자동 전송 실행!");
+    const walletConfigs = getPrivateKeysFromEnv();
 
-    // 컨트랙트 실행
-    const tx = await autoSend.autoSendTokens(TOKEN, gas, poolAmount, fee);
-    await tx.wait();
+    if (walletConfigs.length === 0) {
+      return res.status(500).json({
+        ok: false,
+        error: "PRIVATE_KEY_1, PRIVATE_KEY_2 ... 환경변수를 찾지 못했습니다.",
+      });
+    }
 
-    console.log("TX 완료:", tx.hash);
+    // 임시 지갑 하나로 decimals 확인
+    const tempWallet = new Wallet(walletConfigs[0].privateKey, provider);
+    const tempToken = new Contract(TOKEN_ADDRESS, erc20Abi, tempWallet);
+    const decimals = await tempToken.decimals();
 
-    // Firestore 업데이트
-    await ref.set({
-      last_action: now,
-      next_active: now + TEST_INTERVAL,
-      last_tx: tx.hash,
-      updated_at: new Date().toISOString()
-    }, { merge: true });
+    const amountWei = parseUnits(amount, decimals);
+
+    const results = [];
+
+    for (const cfg of walletConfigs) {
+      const wallet = new Wallet(cfg.privateKey, provider);
+      const fromAddress = await wallet.getAddress();
+
+      const token = new Contract(TOKEN_ADDRESS, erc20Abi, wallet);
+
+      // 잔고 체크(선택사항이지만 안전하게)
+      const balance = await token.balanceOf(fromAddress);
+      if (balance < amountWei) {
+        results.push({
+          index: cfg.index,
+          from: fromAddress,
+          skipped: true,
+          reason: "SZPN 잔고 부족",
+        });
+        continue;
+      }
+
+      // 실제 전송
+      const tx = await token.transfer(POOL_ADDRESS, amountWei);
+      const receipt = await tx.wait();
+
+      results.push({
+        index: cfg.index,
+        from: fromAddress,
+        to: POOL_ADDRESS,
+        hash: tx.hash,
+        status: receipt.status,
+      });
+    }
 
     return res.status(200).json({
       ok: true,
-      tx: tx.hash
+      to: POOL_ADDRESS,
+      amount,
+      wallets: results.length,
+      results,
     });
-
   } catch (err) {
-    console.error("🔥 ERROR:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("auto-martin ERROR:", err);
+    return res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
   }
+}
+
+// 단순한 RPC_URL 체크용 (선택)
+function RPC_URL_OK() {
+  return typeof process.env.RPC_URL === "string" && process.env.RPC_URL.startsWith("http");
 }

@@ -1,16 +1,10 @@
 // api/init-wallets.js
-// 마틴 & 한상훈 지갑 10개를 Firestore /users/{address} 에 한 번에 등록
 
 import admin from "firebase-admin";
 
-// --- 1. Firebase Admin 초기화 ---------------------------------------------
-
 if (!admin.apps.length) {
   const firebaseKeyBase64 = process.env.FIREBASE_KEY_BASE64;
-
-  if (!firebaseKeyBase64) {
-    throw new Error("FIREBASE_KEY_BASE64 환경변수가 설정되어 있지 않습니다.");
-  }
+  if (!firebaseKeyBase64) throw new Error("FIREBASE_KEY_BASE64 미설정");
 
   const firebaseKeyJson = JSON.parse(
     Buffer.from(firebaseKeyBase64, "base64").toString("utf8")
@@ -22,9 +16,6 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-
-// --- 2. 초기 등록할 지갑 목록 ---------------------------------------------
-// 필요하면 여기 배열만 수정하시면 됩니다.
 
 const INITIAL_WALLETS = [
   { address: "0x21ed393edb4D635aDeEe39c9441c9c682AB11570", nickname: "마틴H-1" },
@@ -41,84 +32,57 @@ const INITIAL_WALLETS = [
   { address: "0xFa2cD9f9b6d0DF26B0B77d05dd25e744Ed705e08", nickname: "한상훈H-3" },
 ];
 
-// --- 3. 기본 초기값 템플릿 --------------------------------------------------
-
-function buildInitialDoc(nickname) {
-  const now = 0; // 아직 아무 것도 안 했으니 0으로 시작
-
+function defaultDoc(nickname) {
   return {
     nickname,
-    last_gas_sent_time: now,
-    last_pool_time: now,
-    last_reward_time: now,
-    next_gas_time: now,
-    status: "IDLE", // IDLE: 대기 상태
+    last_gas_sent_time: 0,
+    last_pool_time: 0,
+    last_reward_time: 0,
+    next_gas_time: 0,
+    status: "IDLE",
   };
 }
 
-// --- 4. API 핸들러 ---------------------------------------------------------
-
 export default async function handler(req, res) {
   try {
-    if (req.method !== "GET" && req.method !== "POST") {
+    if (!["GET", "POST"].includes(req.method))
       return res.status(405).json({ ok: false, error: "Method Not Allowed" });
-    }
 
-    // ?secret=XXXX 보호장치 (INIT_SECRET 가 설정되어 있을 때만 체크)
-    const REQUIRED_SECRET = process.env.INIT_SECRET || null;
-    if (REQUIRED_SECRET) {
-      const secret = req.query.secret || req.body?.secret;
-      if (secret !== REQUIRED_SECRET) {
+    const REQUIRED = process.env.INIT_SECRET;
+    if (REQUIRED) {
+      const s = req.query.secret || req.body?.secret;
+      if (s !== REQUIRED)
         return res.status(401).json({ ok: false, error: "Unauthorized" });
-      }
     }
 
-    const usersCol = db.collection("users");
-    let created = 0;
-    let updated = 0;
+    const users = db.collection("users");
+    let created = 0,
+      updated = 0;
 
-    const ops = INITIAL_WALLETS.map(async (w) => {
-      const addr = w.address.trim();
-      const docRef = usersCol.doc(addr);
+    await Promise.all(
+      INITIAL_WALLETS.map(async (w) => {
+        const ref = users.doc(w.address);
+        const snap = await ref.get();
+        const base = defaultDoc(w.nickname);
 
-      const snap = await docRef.get();
-      const baseData = buildInitialDoc(w.nickname);
+        if (!snap.exists) {
+          await ref.set(base);
+          created++;
+        } else {
+          await ref.set({ nickname: w.nickname }, { merge: true });
+          updated++;
+        }
+      })
+    );
 
-      if (!snap.exists) {
-        await docRef.set(baseData);
-        created += 1;
-      } else {
-        // 이미 있으면 기본 필드 누락만 채워준다.
-        await docRef.set(
-          {
-            nickname: w.nickname,
-            last_gas_sent_time:
-              snap.get("last_gas_sent_time") ?? baseData.last_gas_sent_time,
-            last_pool_time:
-              snap.get("last_pool_time") ?? baseData.last_pool_time,
-            last_reward_time:
-              snap.get("last_reward_time") ?? baseData.last_reward_time,
-            next_gas_time: snap.get("next_gas_time") ?? baseData.next_gas_time,
-            status: snap.get("status") ?? baseData.status,
-          },
-          { merge: true }
-        );
-        updated += 1;
-      }
-    });
-
-    await Promise.all(ops);
-
-    return res.status(200).json({
+    return res.json({
       ok: true,
       message: "HIVE3 지갑 초기화 완료",
       created,
       updated,
       total: INITIAL_WALLETS.length,
     });
-  } catch (err) {
-    console.error("[init-wallets] ERROR:", err);
-    return res.status(500).json({ ok: false, error: err.message });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
 }
-

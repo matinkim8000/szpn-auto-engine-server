@@ -1,3 +1,18 @@
+export default async function handler(req, res) {
+  try {
+    const key = process.env.FIREBASE_KEY_BASE64;
+
+    if (!key) {
+      return res.status(500).json({ error: "FIREBASE_KEY_BASE64 missing" });
+    }
+
+    return res.status(200).json({ ok: true, message: "env ok" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+
 /**
  * api/run-cycle.js
  * HIVE3 자동엔진 메인 사이클
